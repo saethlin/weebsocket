@@ -6,7 +6,7 @@ pub enum Message {
     Pong(Vec<u8>),
     Text(String),
     Binary(Vec<u8>),
-    Close,
+    Close(Option<(u16, String)>),
 }
 
 pub enum Client {
@@ -109,32 +109,44 @@ impl Client {
 
     // only fin frames
     pub fn send_message(&mut self, message: &Message) -> std::io::Result<()> {
-        let (opcode, data) = match message {
-            Message::Text(s) => (1, s.as_bytes()),
-            Message::Binary(b) => (2, b.as_slice()),
-            Message::Close => (8, &[][..]),
-            Message::Ping(b) => (9, b.as_slice()),
-            Message::Pong(b) => (10, b.as_slice()),
+        let (opcode, len) = match message {
+            Message::Text(b) => (1, b.len()),
+            Message::Binary(b) => (2, b.len()),
+            Message::Close(None) => (8, 0),
+            Message::Close(Some((_, b))) => (8, b.len() + 2),
+            Message::Ping(b) => (9, b.len()),
+            Message::Pong(b) => (10, b.len()),
         };
 
         // write fin, rsv, and opcode.
         // fin always 1, rsv always 0
         self.write(&[128 + opcode])?;
 
-        if data.len() > u16::max_value() as usize {
-            assert!(data.len() <= i64::max_value() as usize);
+        if len > u16::max_value() as usize {
+            assert!(len <= i64::max_value() as usize);
             self.write(&[128 + 127])?;
-            self.write(&(data.len() as u64).to_be_bytes())?;
-        } else if data.len() > 125 {
+            self.write(&(len as u64).to_be_bytes())?;
+        } else if len > 125 {
             self.write(&[128 + 126])?;
-            self.write(&(data.len() as u16).to_be_bytes())?;
+            self.write(&(len as u16).to_be_bytes())?;
         } else {
-            self.write(&[128 + data.len() as u8])?;
+            self.write(&[128 + len as u8])?;
         }
 
+        // TODO: Generate and write a mask
         self.write(&[0, 0, 0, 0])?;
 
-        self.write(&data)?;
+        match message {
+            Message::Text(b) => self.write(b.as_bytes())?,
+            Message::Binary(b) => self.write(b)?,
+            Message::Close(None) => 0, // Number of bytes written
+            Message::Close(Some((reason, b))) => {
+                self.write(&reason.to_be_bytes())?;
+                self.write(b.as_bytes())?
+            }
+            Message::Ping(b) => self.write(b)?,
+            Message::Pong(b) => self.write(b)?,
+        };
 
         Ok(())
     }
@@ -187,7 +199,14 @@ impl Client {
         Ok(match opcode {
             1 => Message::Text(String::from_utf8(data).unwrap()),
             2 => Message::Binary(data),
-            8 => Message::Close,
+            8 => {
+                if data.is_empty() {
+                    Message::Close(None)
+                } else {
+                    let code = u16::from_be_bytes([data[0], data[1]]);
+                    Message::Close(Some((code, String::from_utf8(data[2..].to_vec()).unwrap())))
+                }
+            }
             9 => Message::Ping(data),
             10 => Message::Pong(data),
             _ => panic!("Unrecognized opcode"),
