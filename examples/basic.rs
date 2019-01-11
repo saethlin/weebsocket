@@ -1,7 +1,7 @@
 use weebsocket::{Client, Message};
 
 fn main() -> std::io::Result<()> {
-    let mut client = Client::connect("127.0.0.1:2794").unwrap();
+    let mut client = Client::connect_insecure("127.0.0.1:2794").unwrap();
 
     // Read the hello websocket message
     println!("{:?}", client.read_message());

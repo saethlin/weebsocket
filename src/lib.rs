@@ -9,25 +9,79 @@ pub enum Message {
     Close,
 }
 
-#[derive(Debug)]
-pub struct Client {
-    stream: std::net::TcpStream,
+pub enum Client {
+    Tcp(std::net::TcpStream),
+    #[cfg(feature = "tls")]
+    Tls(rustls::StreamOwned<rustls::ClientSession, std::net::TcpStream>),
 }
 
 impl Client {
-    pub fn connect<T>(addr: T) -> std::io::Result<Self>
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Client::Tcp(s) => s.write(bytes),
+            #[cfg(feature = "tls")]
+            Client::Tls(s) => s.write(bytes),
+        }
+    }
+
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Client::Tcp(s) => s.read(bytes),
+            #[cfg(feature = "tls")]
+            Client::Tls(s) => s.read(bytes),
+        }
+    }
+
+    #[cfg(feature = "tls")]
+    pub fn connect_secure(uri: &str) -> std::io::Result<Self> {
+        let uri: http::Uri = http::HttpTryFrom::try_from(uri).unwrap();
+        let host = uri.host().unwrap();
+        let port = uri.port_part().map(|p| p.as_u16()).unwrap_or(443);
+
+        let mut config = rustls::ClientConfig::new();
+        config
+            .root_store
+            .add_server_trust_anchors(&webpki_roots::TLS_SERVER_ROOTS);
+        let config = std::sync::Arc::new(config);
+
+        let dns_name = webpki::DNSNameRef::try_from_ascii_str(host).unwrap();
+        let session = rustls::ClientSession::new(&config, dns_name);
+        let socket = std::net::TcpStream::connect((host, port))?;
+
+        let mut stream = rustls::StreamOwned::new(session, socket);
+
+        Self::init_connection(&mut stream, &uri)?;
+
+        Ok(Client::Tls(stream))
+    }
+
+    pub fn connect_insecure(uri: &str) -> std::io::Result<Self> {
+        let uri: http::Uri = http::HttpTryFrom::try_from(uri).unwrap();
+        let host = uri.host().unwrap();
+        let port = uri.port_part().map(|p| p.as_u16()).unwrap_or(80);
+
+        let mut stream = std::net::TcpStream::connect((host, port))?;
+
+        Self::init_connection(&mut stream, &uri)?;
+
+        Ok(Client::Tcp(stream))
+    }
+
+    fn init_connection<S>(stream: &mut S, uri: &http::Uri) -> std::io::Result<()>
     where
-        T: std::net::ToSocketAddrs,
+        S: std::io::Write + std::io::Read,
     {
-        let mut stream = std::net::TcpStream::connect(addr)?;
+        let path = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+        let host = uri.host().unwrap();
         write!(
             stream,
-            "GET / HTTP/1.1\r\n\
-             Host: 127.0.0.1\r\n\
+            "GET {} HTTP/1.1\r\n\
+             Host: {}\r\n\
              Upgrade: websocket\r\n\
              Connection: Upgrade\r\n\
              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
-             Sec-WebSocket-Version: 13\r\n\r\n"
+             Sec-WebSocket-Version: 13\r\n\r\n",
+            path, host,
         )?;
 
         let mut buf = [0; 2048];
@@ -45,12 +99,12 @@ impl Client {
         assert_eq!(
             headers[..]
                 .iter()
-                .find(|h| h.name == "Sec-WebSocket-Accept")
+                .find(|h| h.name.to_lowercase() == "sec-websocket-accept")
                 .map(|h| h.value),
             Some(&b"s3pPLMBiTxaQ9kYGzzhZRbK+xOo="[..])
         );
 
-        Ok(Self { stream })
+        Ok(())
     }
 
     // only fin frames
@@ -65,30 +119,30 @@ impl Client {
 
         // write fin, rsv, and opcode.
         // fin always 1, rsv always 0
-        self.stream.write(&[128 + opcode])?;
+        self.write(&[128 + opcode])?;
 
         if data.len() > u16::max_value() as usize {
             assert!(data.len() <= i64::max_value() as usize);
-            self.stream.write(&[128 + 127])?;
-            self.stream.write(&(data.len() as u64).to_ne_bytes())?;
+            self.write(&[128 + 127])?;
+            self.write(&(data.len() as u64).to_be_bytes())?;
         } else if data.len() > 125 {
-            self.stream.write(&[128 + 126])?;
-            self.stream.write(&(data.len() as u16).to_ne_bytes())?;
+            self.write(&[128 + 126])?;
+            self.write(&(data.len() as u16).to_be_bytes())?;
         } else {
-            self.stream.write(&[128 + data.len() as u8])?;
+            self.write(&[128 + data.len() as u8])?;
         }
 
-        self.stream.write(&[0, 0, 0, 0])?;
+        self.write(&[0, 0, 0, 0])?;
 
-        self.stream.write(&data)?;
+        self.write(&data)?;
 
         Ok(())
     }
 
     // This is really more like a read_frame
-    pub fn read_message(&mut self) -> std::io::Result<Message> {
+    pub fn recv_message(&mut self) -> std::io::Result<Message> {
         let mut bytes = [0; 2];
-        self.stream.read(&mut bytes)?;
+        self.read(&mut bytes)?;
 
         let fin = (bytes[0] & 0b10000000) > 0;
         assert!(
@@ -102,17 +156,17 @@ impl Client {
 
         if payload_length == 126 {
             let mut len_bytes = [0; 2];
-            self.stream.read(&mut len_bytes)?;
-            payload_length = u16::from_ne_bytes(len_bytes) as u64;
+            self.read(&mut len_bytes)?;
+            payload_length = u16::from_be_bytes(len_bytes) as u64;
         } else if payload_length == 127 {
             let mut len_bytes = [0; 8];
-            self.stream.read(&mut len_bytes)?;
-            payload_length = u64::from_ne_bytes(len_bytes);
+            self.read(&mut len_bytes)?;
+            payload_length = u64::from_be_bytes(len_bytes);
         }
 
         let masking_key = if mask {
             let mut key = [0; 4];
-            self.stream.read(&mut key)?;
+            self.read(&mut key)?;
             Some(key)
         } else {
             None
@@ -120,7 +174,8 @@ impl Client {
 
         let mut data = vec![0; payload_length as usize];
         if payload_length > 0 {
-            self.stream.read(&mut data)?;
+            let bytes_read = self.read(&mut data)?;
+            assert_eq!(bytes_read, data.len());
         }
 
         if let Some(key) = masking_key {

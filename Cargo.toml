@@ -6,3 +6,17 @@ edition = "2018"
 
 [dependencies]
 httparse = "1.0"
+http = "0.1"
+
+# TLS
+rustls = {version = "0.14", default-features = false, optional = true}
+webpki = {version = "0.18", optional = true}
+webpki-roots = {version = "0.15", optional = true}
+
+[features]
+default = ["tls"]
+tls = ["rustls", "webpki", "webpki-roots"]
+
+[profile.release]
+lto = true
+panic = 'abort'
