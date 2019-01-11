@@ -1,0 +1,8 @@
+[package]
+name = "weebsocket"
+version = "0.1.0"
+authors = ["Ben Kimock <kimockb@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+httparse = "1.0"
