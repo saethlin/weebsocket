@@ -1,3 +1,4 @@
+use rand_core::RngCore;
 use std::io::{Read, Write};
 
 #[derive(Debug)]
@@ -10,25 +11,28 @@ pub enum Message {
 }
 
 pub enum Client {
-    Tcp(std::net::TcpStream),
+    Tcp(std::net::TcpStream, rand_os::OsRng),
     #[cfg(feature = "tls")]
-    Tls(rustls::StreamOwned<rustls::ClientSession, std::net::TcpStream>),
+    Tls(
+        rustls::StreamOwned<rustls::ClientSession, std::net::TcpStream>,
+        rand_os::OsRng,
+    ),
 }
 
 impl Client {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         match self {
-            Client::Tcp(s) => s.write(bytes),
+            Client::Tcp(s, _) => s.write(bytes),
             #[cfg(feature = "tls")]
-            Client::Tls(s) => s.write(bytes),
+            Client::Tls(s, _) => s.write(bytes),
         }
     }
 
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
         match self {
-            Client::Tcp(s) => s.read(bytes),
+            Client::Tcp(s, _) => s.read(bytes),
             #[cfg(feature = "tls")]
-            Client::Tls(s) => s.read(bytes),
+            Client::Tls(s, _) => s.read(bytes),
         }
     }
 
@@ -52,7 +56,7 @@ impl Client {
 
         Self::init_connection(&mut stream, &uri)?;
 
-        Ok(Client::Tls(stream))
+        Ok(Client::Tls(stream, rand_os::OsRng::new().unwrap()))
     }
 
     pub fn connect_insecure(uri: &str) -> std::io::Result<Self> {
@@ -64,7 +68,7 @@ impl Client {
 
         Self::init_connection(&mut stream, &uri)?;
 
-        Ok(Client::Tcp(stream))
+        Ok(Client::Tcp(stream, rand_os::OsRng::new().unwrap()))
     }
 
     fn init_connection<S>(stream: &mut S, uri: &http::Uri) -> std::io::Result<()>
@@ -134,19 +138,34 @@ impl Client {
         }
 
         // TODO: Generate and write a mask
-        self.write(&[0, 0, 0, 0])?;
+        let mut mask = [0; 4];
+        match self {
+            Client::Tcp(_, rng) => rng.fill_bytes(&mut mask),
+            #[cfg(feature = "tls")]
+            Client::Tls(_, rng) => rng.fill_bytes(&mut mask),
+        }
+        self.write(&mask)?;
 
-        match message {
-            Message::Text(b) => self.write(b.as_bytes())?,
-            Message::Binary(b) => self.write(b)?,
-            Message::Close(None) => 0, // Number of bytes written
+        let mut data = match message {
+            Message::Text(b) => b.as_bytes().to_vec(),
+            Message::Binary(b) => b.to_vec(),
+            Message::Close(None) => Vec::new(), // Number of bytes written
             Message::Close(Some((reason, b))) => {
-                self.write(&reason.to_be_bytes())?;
-                self.write(b.as_bytes())?
+                let mut v = Vec::with_capacity(2 + b.len());
+                v.extend_from_slice(&reason.to_be_bytes());
+                v.extend_from_slice(b.as_bytes());
+                v
             }
-            Message::Ping(b) => self.write(b)?,
-            Message::Pong(b) => self.write(b)?,
+            Message::Ping(b) => b.to_vec(),
+            Message::Pong(b) => b.to_vec(),
         };
+
+        // Apply the mask
+        for i in 0..data.len() {
+            data[i] ^= mask[i % 4];
+        }
+
+        self.write(&data)?;
 
         Ok(())
     }
