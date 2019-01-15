@@ -15,6 +15,8 @@ rustls = {version = "0.14", default-features = false, optional = true}
 webpki = {version = "0.18", optional = true}
 webpki-roots = {version = "0.15", optional = true}
 
+mio = "0.6"
+
 [features]
 default = ["tls"]
 tls = ["rustls", "webpki", "webpki-roots"]

@@ -1,41 +1,78 @@
+use crate::Message;
 use rand_core::RngCore;
 use std::io::{Read, Write};
 
-pub mod async_client;
+const SEND_CHANNEL: mio::Token = mio::Token(0);
+const STREAM: mio::Token = mio::Token(1);
 
-#[derive(Debug)]
-pub enum Message {
-    Ping(Vec<u8>),
-    Pong(Vec<u8>),
-    Text(String),
-    Binary(Vec<u8>),
-    Close(Option<(u16, String)>),
+pub struct Client {
+    sender: std::sync::mpsc::SyncSender<Message>,
+    receiver: std::sync::mpsc::Receiver<Message>,
+    readiness: mio::SetReadiness,
 }
 
-pub enum Client {
-    Tcp(std::net::TcpStream, rand_os::OsRng),
+pub enum Stream {
+    Tcp(mio::net::TcpStream),
     #[cfg(feature = "tls")]
-    Tls(
-        rustls::StreamOwned<rustls::ClientSession, std::net::TcpStream>,
-        rand_os::OsRng,
-    ),
+    Tls(rustls::StreamOwned<rustls::ClientSession, mio::net::TcpStream>),
 }
 
-impl Client {
+impl Stream {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         match self {
-            Client::Tcp(s, _) => s.write(bytes),
+            Stream::Tcp(s) => s.write(bytes),
             #[cfg(feature = "tls")]
-            Client::Tls(s, _) => s.write(bytes),
+            Stream::Tls(s) => s.write(bytes),
         }
     }
 
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
         match self {
-            Client::Tcp(s, _) => s.read(bytes),
+            Stream::Tcp(s) => s.read(bytes),
             #[cfg(feature = "tls")]
-            Client::Tls(s, _) => s.read(bytes),
+            Stream::Tls(s) => s.read(bytes),
         }
+    }
+}
+
+impl Client {
+    fn new() -> (
+        std::sync::mpsc::SyncSender<Message>,
+        std::sync::mpsc::Receiver<Message>,
+    ) {
+        let (registration, readiness) = mio::Registration::new2();
+        let (input_sender, input_receiver) = std::sync::mpsc::sync_channel(100);
+        let (output_sender, output_receiver) = std::sync::mpsc::sync_channel(100);
+
+        std::thread::spawn(move || {
+            let mut poll = mio::Poll::new().unwrap();
+            let mut events = mio::Events::with_capacity(4);
+            poll.register(
+                &registration,
+                SEND_CHANNEL,
+                mio::Ready::readable(),
+                mio::PollOpt::edge(),
+            )
+            .unwrap();
+
+            loop {
+                poll.poll(&mut events, None).unwrap();
+
+                for ev in events.iter() {
+                    if ev.token() == SEND_CHANNEL {
+                        // A new session has been attached to the poll loop
+                        let message = input_receiver.recv().unwrap();
+                    } else {
+                        // Else, we need to handle reads on the stream
+                        stream.ready(&mut poll, &ev).unwrap();
+
+                        // TODO: Check if we're now done reading a message, and handle that
+                    }
+                }
+            }
+        });
+
+        (input_sender, output_receiver)
     }
 
     #[cfg(feature = "tls")]
@@ -58,7 +95,11 @@ impl Client {
 
         Self::init_connection(&mut stream, &uri)?;
 
-        Ok(Client::Tls(stream, rand_os::OsRng::new().unwrap()))
+        Ok(Client {
+            rng: rand_os::OsRng::new().unwrap(),
+            buf: Vec::new(),
+            stream: Stream::Tls(stream),
+        })
     }
 
     pub fn connect_insecure(uri: &str) -> std::io::Result<Self> {
@@ -70,7 +111,11 @@ impl Client {
 
         Self::init_connection(&mut stream, &uri)?;
 
-        Ok(Client::Tcp(stream, rand_os::OsRng::new().unwrap()))
+        Ok(Client {
+            rng: rand_os::OsRng::new().unwrap(),
+            buf: Vec::new(),
+            stream: Stream::Tcp(stream),
+        })
     }
 
     fn init_connection<S>(stream: &mut S, uri: &http::Uri) -> std::io::Result<()>
@@ -141,11 +186,7 @@ impl Client {
 
         // TODO: Generate and write a mask
         let mut mask = [0; 4];
-        match self {
-            Client::Tcp(_, rng) => rng.fill_bytes(&mut mask),
-            #[cfg(feature = "tls")]
-            Client::Tls(_, rng) => rng.fill_bytes(&mut mask),
-        }
+        self.rng.fill_bytes(&mut mask);
         self.write(&mask)?;
 
         let mut data = match message {
