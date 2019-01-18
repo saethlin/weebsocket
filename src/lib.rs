@@ -1,7 +1,8 @@
 use rand_core::RngCore;
 use std::io::{Read, Write};
 
-pub mod async_client;
+mod parse;
+//pub mod async_client;
 
 #[derive(Debug)]
 pub enum Message {
@@ -10,6 +11,12 @@ pub enum Message {
     Text(String),
     Binary(Vec<u8>),
     Close(Option<(u16, String)>),
+}
+
+struct Frame {
+    fin: bool,
+    opcode: u8,
+    data: Vec<u8>,
 }
 
 pub enum Client {
@@ -21,20 +28,22 @@ pub enum Client {
     ),
 }
 
+impl std::io::Read for Client {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Client::Tcp(s, _) => s.read(bytes),
+            #[cfg(feature = "tls")]
+            Client::Tls(s, _) => s.read(bytes),
+        }
+    }
+}
+
 impl Client {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         match self {
             Client::Tcp(s, _) => s.write(bytes),
             #[cfg(feature = "tls")]
             Client::Tls(s, _) => s.write(bytes),
-        }
-    }
-
-    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
-        match self {
-            Client::Tcp(s, _) => s.read(bytes),
-            #[cfg(feature = "tls")]
-            Client::Tls(s, _) => s.read(bytes),
         }
     }
 
@@ -172,49 +181,20 @@ impl Client {
         Ok(())
     }
 
-    // This is really more like a read_frame
     pub fn recv_message(&mut self) -> std::io::Result<Message> {
-        let mut bytes = [0; 2];
-        self.read(&mut bytes)?;
-
-        let fin = (bytes[0] & 0b10000000) > 0;
-        assert!(
-            fin,
-            "Got a multi-frame message, but those aren't supported yet"
-        );
-        //let rsv = bytes[0] & 0b01110000;
-        let opcode = bytes[0] & 0b00001111;
-        let mask = bytes[1] & 0b10000000 > 0;
-        let mut payload_length = (bytes[1] & 0b01111111) as u64;
-
-        if payload_length == 126 {
-            let mut len_bytes = [0; 2];
-            self.read(&mut len_bytes)?;
-            payload_length = u16::from_be_bytes(len_bytes) as u64;
-        } else if payload_length == 127 {
-            let mut len_bytes = [0; 8];
-            self.read(&mut len_bytes)?;
-            payload_length = u64::from_be_bytes(len_bytes);
-        }
-
-        let masking_key = if mask {
-            let mut key = [0; 4];
-            self.read(&mut key)?;
-            Some(key)
-        } else {
-            None
-        };
-
-        let mut data = vec![0; payload_length as usize];
-        if payload_length > 0 {
-            let bytes_read = self.read(&mut data)?;
-            assert_eq!(bytes_read, data.len());
-        }
-
-        if let Some(key) = masking_key {
-            for i in 0..data.len() {
-                data[i] ^= key[i % 4];
-            }
+        let Frame {
+            mut fin,
+            opcode,
+            mut data,
+        } = self.recv_frame()?;
+        while !fin {
+            let frame = self.recv_frame()?;
+            data.extend_from_slice(&frame.data);
+            fin = frame.fin;
+            assert!(
+                frame.opcode == 0,
+                "Continuation frames must have opcode == 0"
+            );
         }
 
         Ok(match opcode {
@@ -232,5 +212,45 @@ impl Client {
             10 => Message::Pong(data),
             _ => panic!("Unrecognized opcode"),
         })
+    }
+
+    // This is really more like a read_frame
+    fn recv_frame(&mut self) -> std::io::Result<Frame> {
+        use crate::mask;
+        use crate::parse::ReadExt;
+
+        let (fin, _rsv, opcode) = mask!(self.read_u8()?, 0b10000000, 0b01110000, 0b00001111);
+        let fin = fin > 0;
+
+        let (mask, payload_length) = mask!(self.read_u8()?, 0b10000000, 0b01111111);
+        let mask = mask > 0;
+        let mut payload_length = payload_length as u64;
+
+        if payload_length == 126 {
+            payload_length = self.read_u16_be()? as u64;
+        } else if payload_length == 127 {
+            payload_length = self.read_u64_be()?;
+        }
+
+        let masking_key = if mask {
+            let mut key = [0; 4];
+            self.read(&mut key)?;
+            Some(key)
+        } else {
+            None
+        };
+
+        let mut data = vec![0; payload_length as usize];
+        if payload_length > 0 {
+            self.read_exact(&mut data)?;
+        }
+
+        if let Some(key) = masking_key {
+            for i in 0..data.len() {
+                data[i] ^= key[i % 4];
+            }
+        }
+
+        Ok(Frame { fin, opcode, data })
     }
 }
