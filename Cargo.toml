@@ -7,8 +7,6 @@ edition = "2018"
 [dependencies]
 httparse = "1.0"
 http = "0.1"
-rand_core = "0.3"
-rand_os = "0.1"
 
 # TLS
 rustls = {version = "0.14", default-features = false, optional = true}

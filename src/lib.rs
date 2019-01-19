@@ -1,4 +1,3 @@
-use rand_core::RngCore;
 use std::io::{Read, Write};
 
 mod parse;
@@ -19,34 +18,46 @@ struct Frame {
     data: Vec<u8>,
 }
 
-pub enum Client {
-    Tcp(std::net::TcpStream, rand_os::OsRng),
-    #[cfg(feature = "tls")]
-    Tls(
-        rustls::StreamOwned<rustls::ClientSession, std::net::TcpStream>,
-        rand_os::OsRng,
-    ),
+pub struct Client {
+    rng: XoshiroRng,
+    stream: Stream,
 }
 
-impl std::io::Read for Client {
+enum Stream {
+    Tcp(std::net::TcpStream),
+    #[cfg(feature = "tls")]
+    Tls(rustls::StreamOwned<rustls::ClientSession, std::net::TcpStream>),
+}
+
+impl std::io::Read for Stream {
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
         match self {
-            Client::Tcp(s, _) => s.read(bytes),
+            Stream::Tcp(s) => s.read(bytes),
             #[cfg(feature = "tls")]
-            Client::Tls(s, _) => s.read(bytes),
+            Stream::Tls(s) => s.read(bytes),
+        }
+    }
+}
+
+impl std::io::Write for Stream {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Stream::Tcp(s) => s.write(bytes),
+            #[cfg(feature = "tls")]
+            Stream::Tls(s) => s.write(bytes),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Stream::Tcp(s) => s.flush(),
+            #[cfg(feature = "tls")]
+            Stream::Tls(s) => s.flush(),
         }
     }
 }
 
 impl Client {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        match self {
-            Client::Tcp(s, _) => s.write(bytes),
-            #[cfg(feature = "tls")]
-            Client::Tls(s, _) => s.write(bytes),
-        }
-    }
-
     #[cfg(feature = "tls")]
     pub fn connect_secure(uri: &str) -> std::io::Result<Self> {
         let uri: http::Uri = http::HttpTryFrom::try_from(uri).unwrap();
@@ -67,7 +78,10 @@ impl Client {
 
         Self::init_connection(&mut stream, &uri)?;
 
-        Ok(Client::Tls(stream, rand_os::OsRng::new().unwrap()))
+        Ok(Client {
+            stream: Stream::Tls(stream),
+            rng: XoshiroRng::new(),
+        })
     }
 
     pub fn connect_insecure(uri: &str) -> std::io::Result<Self> {
@@ -79,7 +93,10 @@ impl Client {
 
         Self::init_connection(&mut stream, &uri)?;
 
-        Ok(Client::Tcp(stream, rand_os::OsRng::new().unwrap()))
+        Ok(Client {
+            stream: Stream::Tcp(stream),
+            rng: XoshiroRng::new(),
+        })
     }
 
     fn init_connection<S>(stream: &mut S, uri: &http::Uri) -> std::io::Result<()>
@@ -135,27 +152,22 @@ impl Client {
 
         // write fin, rsv, and opcode.
         // fin always 1, rsv always 0
-        self.write(&[128 + opcode])?;
+        self.stream.write(&[128 + opcode])?;
 
         if len > u16::max_value() as usize {
             assert!(len <= i64::max_value() as usize);
-            self.write(&[128 + 127])?;
-            self.write(&(len as u64).to_be_bytes())?;
+            self.stream.write(&[128 + 127])?;
+            self.stream.write(&(len as u64).to_be_bytes())?;
         } else if len > 125 {
-            self.write(&[128 + 126])?;
-            self.write(&(len as u16).to_be_bytes())?;
+            self.stream.write(&[128 + 126])?;
+            self.stream.write(&(len as u16).to_be_bytes())?;
         } else {
-            self.write(&[128 + len as u8])?;
+            self.stream.write(&[128 + len as u8])?;
         }
 
         // TODO: Generate and write a mask
-        let mut mask = [0; 4];
-        match self {
-            Client::Tcp(_, rng) => rng.fill_bytes(&mut mask),
-            #[cfg(feature = "tls")]
-            Client::Tls(_, rng) => rng.fill_bytes(&mut mask),
-        }
-        self.write(&mask)?;
+        let mask = self.rng.next_u32().to_ne_bytes();
+        self.stream.write(&mask)?;
 
         let mut data = match message {
             Message::Text(b) => b.as_bytes().to_vec(),
@@ -176,7 +188,7 @@ impl Client {
             data[i] ^= mask[i % 4];
         }
 
-        self.write(&data)?;
+        self.stream.write(&data)?;
 
         Ok(())
     }
@@ -219,22 +231,22 @@ impl Client {
         use crate::mask;
         use crate::parse::ReadExt;
 
-        let (fin, _rsv, opcode) = mask!(self.read_u8()?, 0b10000000, 0b01110000, 0b00001111);
+        let (fin, _rsv, opcode) = mask!(self.stream.read_u8()?, 0b10000000, 0b01110000, 0b00001111);
         let fin = fin > 0;
 
-        let (mask, payload_length) = mask!(self.read_u8()?, 0b10000000, 0b01111111);
+        let (mask, payload_length) = mask!(self.stream.read_u8()?, 0b10000000, 0b01111111);
         let mask = mask > 0;
         let mut payload_length = payload_length as u64;
 
         if payload_length == 126 {
-            payload_length = self.read_u16_be()? as u64;
+            payload_length = self.stream.read_u16_be()? as u64;
         } else if payload_length == 127 {
-            payload_length = self.read_u64_be()?;
+            payload_length = self.stream.read_u64_be()?;
         }
 
         let masking_key = if mask {
             let mut key = [0; 4];
-            self.read(&mut key)?;
+            self.stream.read(&mut key)?;
             Some(key)
         } else {
             None
@@ -242,7 +254,7 @@ impl Client {
 
         let mut data = vec![0; payload_length as usize];
         if payload_length > 0 {
-            self.read_exact(&mut data)?;
+            self.stream.read_exact(&mut data)?;
         }
 
         if let Some(key) = masking_key {
@@ -252,5 +264,47 @@ impl Client {
         }
 
         Ok(Frame { fin, opcode, data })
+    }
+}
+
+// The websocket RFC requires the contents of messages be randomly masked,
+// but that's only done to scramble the bits to protect broken proxies from
+// opening themselves up to cache-based attacks, an attack that has never 
+// actually been observed.
+// We're not going to hurt ourselves trying to save broken proxies.
+struct XoshiroRng {
+    s: [u64; 4],
+}
+
+impl XoshiroRng {
+    fn rotl(x: u64, k: u64) -> u64 {
+        return (x << k) | (x >> (64 - k));
+    }
+
+    fn new() -> Self {
+        Self {
+            s: [77, 34, 35, 92], // chosen by fair dice roll
+        }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let result_starstar = Self::rotl(self.s[1] * 5, 7) * 9;
+
+        let t = self.s[1] << 17;
+
+        self.s[2] ^= self.s[0];
+        self.s[3] ^= self.s[1];
+        self.s[1] ^= self.s[2];
+        self.s[0] ^= self.s[3];
+
+        self.s[2] ^= t;
+
+        self.s[3] = Self::rotl(self.s[3], 45);
+
+        result_starstar
+    }
+
+    fn next_u32(&mut self) -> u32 {
+        (self.next_u64() >> 32) as u32
     }
 }
