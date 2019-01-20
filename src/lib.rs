@@ -139,7 +139,7 @@ impl Client {
         Ok(())
     }
 
-    // only fin frames
+    // All messages are sent in one frame
     pub fn send_message(&mut self, message: &Message) -> std::io::Result<()> {
         let (opcode, len) = match message {
             Message::Text(b) => (1, b.len()),
@@ -165,7 +165,6 @@ impl Client {
             self.stream.write(&[128 + len as u8])?;
         }
 
-        // TODO: Generate and write a mask
         let mask = self.rng.next_u32().to_ne_bytes();
         self.stream.write(&mask)?;
 
@@ -226,7 +225,6 @@ impl Client {
         })
     }
 
-    // This is really more like a read_frame
     fn recv_frame(&mut self) -> std::io::Result<Frame> {
         use crate::mask;
         use crate::parse::ReadExt;
