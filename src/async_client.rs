@@ -1,9 +1,10 @@
 use crate::Message;
-use std::io::{self, Write};
+use std::io::Write;
 
 const SEND_CHANNEL: mio::Token = mio::Token(0);
 const STREAM: mio::Token = mio::Token(1);
 
+#[derive(Clone)]
 pub struct Sender {
     inner: std::sync::mpsc::SyncSender<Message>,
     readiness: mio::SetReadiness,
@@ -40,8 +41,20 @@ pub fn connect(uri: &str) -> std::io::Result<(Sender, Receiver)> {
 
     let mut tls = crate::tls::TlsClient::new(socket, dns_name, STREAM);
 
-    init_ws_async(&mut tls, &uri)?;
+    let path = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+    let host = uri.host().unwrap();
+    write!(
+        tls,
+        "GET {} HTTP/1.1\r\n\
+         Host: {}\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+         Sec-WebSocket-Version: 13\r\n\r\n",
+        path, host,
+    )?;
     tls.flush().unwrap();
+
     let mut is_initialized = false;
 
     let (registration, readiness) = mio::Registration::new2();
@@ -58,6 +71,13 @@ pub fn connect(uri: &str) -> std::io::Result<(Sender, Receiver)> {
             mio::PollOpt::edge(),
         )
         .unwrap();
+        poll.register(
+            &tls.socket,
+            STREAM,
+            tls.ready_interest(),
+            mio::PollOpt::level() | mio::PollOpt::oneshot(),
+        )
+        .unwrap();
 
         let mut rng = crate::XoshiroRng::new();
 
@@ -70,9 +90,9 @@ pub fn connect(uri: &str) -> std::io::Result<(Sender, Receiver)> {
                     // Dequeue it and write to the tls session
                     while let Ok(message) = input_receiver.try_recv() {
                         crate::write_message(&mut tls, &mut rng, &message).unwrap();
-                        tls.flush().unwrap();
+                        tls.do_write().unwrap();
                     }
-                } else {
+                } else if ev.token() == STREAM {
                     // Else, we need to handle reads on the stream
                     tls.ready(&mut poll, &ev).unwrap();
 
@@ -98,23 +118,6 @@ pub fn connect(uri: &str) -> std::io::Result<(Sender, Receiver)> {
             inner: output_receiver,
         },
     ))
-}
-
-fn init_ws_async(stream: &mut impl io::Write, uri: &http::Uri) -> std::io::Result<()> {
-    let path = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
-    let host = uri.host().unwrap();
-    write!(
-        stream,
-        "GET {} HTTP/1.1\r\n\
-         Host: {}\r\n\
-         Upgrade: websocket\r\n\
-         Connection: Upgrade\r\n\
-         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
-         Sec-WebSocket-Version: 13\r\n\r\n",
-        path, host,
-    )?;
-
-    Ok(())
 }
 
 fn dequeue_ws_init(buf: &mut Vec<u8>) -> Result<(), crate::Error> {

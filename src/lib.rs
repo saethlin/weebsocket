@@ -117,11 +117,11 @@ impl Client {
         })
     }
 
-    pub fn send_message(&mut self, message: &Message) -> Result<(), crate::Error> {
+    pub fn send(&mut self, message: &Message) -> Result<(), crate::Error> {
         write_message(&mut self.stream, &mut self.rng, message)
     }
 
-    pub fn recv_message(&mut self) -> Result<Message, crate::Error> {
+    pub fn recv(&mut self) -> Result<Message, crate::Error> {
         let Frame {
             mut is_fin,
             opcode,
@@ -252,13 +252,13 @@ pub(crate) fn write_message(
     let mut data = match message {
         Message::Text(b) => b.as_bytes().to_vec(),
         Message::Binary(b) => b.to_vec(),
-        Message::Close(None) => Vec::new(), // Number of bytes written
-        Message::Close(Some((reason, b))) => {
-            let mut v = Vec::with_capacity(2 + b.len());
-            v.extend_from_slice(&reason.to_be_bytes());
-            v.extend_from_slice(b.as_bytes());
-            v
-        }
+        Message::Close(None) => Vec::new(),
+        Message::Close(Some((reason, b))) => reason
+            .to_be_bytes()
+            .iter()
+            .copied()
+            .chain(b.bytes())
+            .collect(),
         Message::Ping(b) => b.to_vec(),
         Message::Pong(b) => b.to_vec(),
     };
@@ -284,7 +284,7 @@ struct XoshiroRng {
 
 impl XoshiroRng {
     fn rotl(x: u64, k: u64) -> u64 {
-        (x << k) | (x >> (64 - k))
+        (x << k) | (x >> (64u64.wrapping_sub(k)))
     }
 
     fn new() -> Self {
@@ -294,7 +294,7 @@ impl XoshiroRng {
     }
 
     fn next_u64(&mut self) -> u64 {
-        let result_starstar = Self::rotl(self.s[1] * 5, 7) * 9;
+        let result_starstar = Self::rotl(self.s[1].wrapping_mul(5), 7).wrapping_mul(9);
 
         let t = self.s[1] << 17;
 

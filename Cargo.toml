@@ -15,3 +15,5 @@ mio = {version = "0.6", default-features = false}
 
 [dev-dependencies]
 weeqwest = {git = "https://github.com/saethlin/weeqwest"}
+serde = "1.0"
+serde_json = "1.0"
