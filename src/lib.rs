@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 #![deny(clippy::all)]
 #![warn(clippy::restriction)]
 #![allow(
@@ -6,6 +7,20 @@
     clippy::missing_docs_in_private_items,
     clippy::missing_inline_in_public_items
 )]
+
+//! A wee websocket library powered by mio and rustls; no tokio and no openssl
+//!
+//! `weebsocket` is a basic websocket client library, which compiles reasonably fast, can produce
+//! reasonably small binaries, and is dead simple to use.
+//!
+//! If you don't mind blocking, a `Client` can use blocking I/O on the current thread:
+//! ```rust
+//! use weebsocket::{Client, Message};
+//!
+//! let mut client = Client::connect("wss://echo.websocket.org/").unwrap();
+//! client.send(Message::Text("Hi")).unwrap();
+//! assert_eq!(client.recv().unwrap(), Message::Text("Hi"));
+//! ```
 
 macro_rules! mask {
     ($byte:expr, $($mask:expr),*) => {
@@ -22,6 +37,7 @@ macro_rules! mask {
     };
 }
 
+/// Components of a websocket client that can handle simultaneous send and recieve operations
 pub mod async_client;
 mod error;
 mod parse;
@@ -30,13 +46,26 @@ mod tls;
 pub use error::Error;
 use std::io::{Read, Write};
 
-#[derive(Debug)]
+/// Represents a message that can be sent on a websocket
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Message {
+    /// A Ping message (5.5.2)
     Ping(Vec<u8>),
+    /// A Pong message (5.5.3)
     Pong(Vec<u8>),
+    /// A message that contains UTF-8 encoded text (5.6)
     Text(String),
+    /// A message that contains arbitrary bytes (5.6)
     Binary(Vec<u8>),
+    /// A message that indicate closure of the connection,
+    /// with an optional status code and reason (5.5.1)
     Close(Option<(u16, String)>),
+}
+
+/// Wraps a TLS stream and manages the websocket connection
+pub struct Client {
+    rng: XorshiroRng,
+    stream: Stream,
 }
 
 struct Frame {
@@ -45,14 +74,10 @@ struct Frame {
     data: Vec<u8>,
 }
 
-pub struct Client {
-    rng: XoshiroRng,
-    stream: Stream,
-}
-
 type Stream = rustls::StreamOwned<rustls::ClientSession, std::net::TcpStream>;
 
 impl Client {
+    /// Create a websocket client by connecting to a server at `uri`
     pub fn connect(uri: &str) -> Result<Self, Error> {
         let uri: http::Uri = http::HttpTryFrom::try_from(uri)?;
         let host = uri
@@ -113,14 +138,16 @@ impl Client {
 
         Ok(Client {
             stream,
-            rng: XoshiroRng::new(),
+            rng: XorshiroRng::new(),
         })
     }
 
+    /// Send a websocket message, blocking if needed
     pub fn send(&mut self, message: &Message) -> Result<(), crate::Error> {
         write_message(&mut self.stream, &mut self.rng, message)
     }
 
+    /// Recieve a websocket message, blocking until one is available
     pub fn recv(&mut self) -> Result<Message, crate::Error> {
         let Frame {
             mut is_fin,
@@ -211,7 +238,7 @@ impl Client {
 // All messages are sent in one frame
 pub(crate) fn write_message(
     stream: &mut impl std::io::Write,
-    rng: &mut XoshiroRng,
+    rng: &mut XorshiroRng,
     message: &Message,
 ) -> Result<(), crate::Error> {
     let (opcode, len) = match message {
@@ -278,11 +305,11 @@ pub(crate) fn write_message(
 // opening themselves up to cache-based attacks, an attack that has never
 // actually been observed.
 // We're not going to hurt ourselves trying to save broken proxies.
-struct XoshiroRng {
+struct XorshiroRng {
     s: [u64; 4],
 }
 
-impl XoshiroRng {
+impl XorshiroRng {
     fn rotl(x: u64, k: u64) -> u64 {
         (x << k) | (x >> (64u64.wrapping_sub(k)))
     }

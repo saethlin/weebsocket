@@ -4,6 +4,7 @@ use std::io::Write;
 const SEND_CHANNEL: mio::Token = mio::Token(0);
 const STREAM: mio::Token = mio::Token(1);
 
+/// A handle to an asynchronous client that can send messages to the server
 #[derive(Clone)]
 pub struct Sender {
     inner: std::sync::mpsc::SyncSender<Message>,
@@ -11,6 +12,7 @@ pub struct Sender {
 }
 
 impl Sender {
+    /// Send a message on the corresponding connection. Never blocks.
     pub fn send(&mut self, m: Message) {
         self.inner.send(m).unwrap();
         self.readiness
@@ -19,16 +21,21 @@ impl Sender {
     }
 }
 
+/// A handle to an asynchronous client that can recieve messages sent by the server
 pub struct Receiver {
     inner: std::sync::mpsc::Receiver<Message>,
 }
 
 impl Receiver {
+    /// Recieve a message on the corresponding connection. Blocks if needed.
+    /// Though this blocks the current thread, it does not interfere with the sending of other
+    /// messages.
     pub fn recv(&mut self) -> Message {
         self.inner.recv().unwrap()
     }
 }
 
+/// Create a websocket connection that runs on a background thread
 pub fn connect(uri: &str) -> std::io::Result<(Sender, Receiver)> {
     use std::net::ToSocketAddrs;
     let uri: http::Uri = http::HttpTryFrom::try_from(uri).unwrap();
@@ -79,7 +86,7 @@ pub fn connect(uri: &str) -> std::io::Result<(Sender, Receiver)> {
         )
         .unwrap();
 
-        let mut rng = crate::XoshiroRng::new();
+        let mut rng = crate::XorshiroRng::new();
 
         loop {
             poll.poll(&mut events, None).unwrap();
