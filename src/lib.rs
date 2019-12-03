@@ -79,11 +79,12 @@ type Stream = rustls::StreamOwned<rustls::ClientSession, std::net::TcpStream>;
 impl Client {
     /// Create a websocket client by connecting to a server at `uri`
     pub fn connect(uri: &str) -> Result<Self, Error> {
-        let uri: http::Uri = http::HttpTryFrom::try_from(uri)?;
+        use std::convert::TryFrom;
+        let uri: http::Uri = http::Uri::try_from(uri)?;
         let host = uri
             .host()
             .ok_or_else(|| Error::Custom(format!("No host in URI {:?}", uri)))?;
-        let port = uri.port_part().map(|p| p.as_u16()).unwrap_or(443);
+        let port = uri.port_u16().unwrap_or(443);
         let path = uri
             .path_and_query()
             .map(http::uri::PathAndQuery::as_str)

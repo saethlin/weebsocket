@@ -37,10 +37,11 @@ impl Receiver {
 
 /// Create a websocket connection that runs on a background thread
 pub fn connect(uri: &str) -> std::io::Result<(Sender, Receiver)> {
+    use std::convert::TryFrom;
     use std::net::ToSocketAddrs;
-    let uri: http::Uri = http::HttpTryFrom::try_from(uri).unwrap();
+    let uri: http::Uri = http::Uri::try_from(uri).unwrap();
     let host = uri.host().unwrap();
-    let port = uri.port_part().map(|p| p.as_u16()).unwrap_or(443);
+    let port = uri.port_u16().unwrap_or(443);
 
     let dns_name = webpki::DNSNameRef::try_from_ascii_str(host).unwrap();
     let socket_addr = (host, port).to_socket_addrs().unwrap().next().unwrap();
