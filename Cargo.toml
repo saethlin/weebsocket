@@ -12,6 +12,8 @@ rustls = {version = "0.16", default-features = false}
 webpki = "0.21"
 webpki-roots = "0.18"
 mio = {version = "0.6", default-features = false}
+tokio = {version = "0.2", features = ["tcp", "io-util", "udp", "rt-core", "dns"]}
+tokio-rustls = "0.12"
 
 [dev-dependencies]
 weeqwest = {git = "https://github.com/saethlin/weeqwest"}

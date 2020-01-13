@@ -8,19 +8,29 @@
     clippy::missing_inline_in_public_items
 )]
 
-//! A wee websocket library powered by mio and rustls; no tokio and no openssl
+//! A wee websocket library powered by rustls
 //!
 //! `weebsocket` is a basic websocket client library, which compiles reasonably fast, can produce
 //! reasonably small binaries, and is dead simple to use.
 //!
 //! If you don't mind blocking, a `Client` can use blocking I/O on the current thread:
 //! ```rust
-//! use weebsocket::{Client, Message};
+//! use weebsocket::Message;
 //!
-//! let mut client = Client::connect("wss://echo.websocket.org/").unwrap();
+//! let mut client = weebsocket::blocking::connect("wss://echo.websocket.org/").unwrap();
 //! client.send(Message::Text("Hi")).unwrap();
 //! assert_eq!(client.recv().unwrap(), Message::Text("Hi"));
 //! ```
+
+lazy_static::lazy_static! {
+    pub(crate) static ref TLS_CONFIG: std::sync::Arc<rustls::ClientConfig> = {
+        let mut config = rustls::ClientConfig::new();
+        config
+            .root_store
+            .add_server_trust_anchors(&webpki_roots::TLS_SERVER_ROOTS);
+        std::sync::Arc::new(config)
+    };
+}
 
 macro_rules! mask {
     ($byte:expr, $($mask:expr),*) => {
@@ -37,16 +47,13 @@ macro_rules! mask {
     };
 }
 
-/// Components of a websocket client that can handle simultaneous send and recieve operations
-pub mod async_client;
+/// A websocket client that uses blocking I/O on the current thread
+pub mod blocking;
 mod error;
-mod parse;
-mod tls;
 
 pub use error::Error;
-use std::io::{Read, Write};
 
-/// Represents a message that can be sent on a websocket
+/// A websocket message, used by `Client::send` and `Client::recv`
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Message {
     /// A Ping message (5.5.2)
@@ -62,24 +69,24 @@ pub enum Message {
     Close(Option<(u16, String)>),
 }
 
-/// Wraps a TLS stream and manages the websocket connection
+pub(crate) struct Frame {
+    pub is_fin: bool,
+    pub opcode: u8,
+    pub data: Vec<u8>,
+}
+
+/// Represents a websocket Stream and Sink
 pub struct Client {
+    stream: tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
     rng: XorshiroRng,
-    stream: Stream,
 }
-
-struct Frame {
-    is_fin: bool,
-    opcode: u8,
-    data: Vec<u8>,
-}
-
-type Stream = rustls::StreamOwned<rustls::ClientSession, std::net::TcpStream>;
 
 impl Client {
-    /// Create a websocket client by connecting to a server at `uri`
-    pub fn connect(uri: &str) -> Result<Self, Error> {
+    /// Creates a futures that resolves to a websocket connection
+    pub async fn connect(uri: &str) -> Result<Self, Error> {
         use std::convert::TryFrom;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
         let uri: http::Uri = http::Uri::try_from(uri)?;
         let host = uri
             .host()
@@ -92,26 +99,24 @@ impl Client {
 
         let dns_name =
             webpki::DNSNameRef::try_from_ascii_str(host).map_err(|_| Error::InvalidHostname)?;
-        let session = rustls::ClientSession::new(&crate::tls::TLS_CONFIG, dns_name);
-        let socket = std::net::TcpStream::connect((host, port))?;
 
-        let mut stream = rustls::StreamOwned::new(session, socket);
+        let stream = tokio::net::TcpStream::connect((host, port)).await?;
+        let connector = tokio_rustls::TlsConnector::from(TLS_CONFIG.clone());
+        let mut tls = connector.connect(dns_name, stream).await?;
 
-        write!(
-            stream,
+        let data = format!(
             "GET {} HTTP/1.1\r\n\
-             Host: {}\r\n\
-             Connection: Upgrade\r\n\
-             Upgrade: websocket\r\n\
-             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
-             Sec-WebSocket-Version: 13\r\n\r\n",
+         Host: {}\r\n\
+         Connection: Upgrade\r\n\
+         Upgrade: websocket\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+         Sec-WebSocket-Version: 13\r\n\r\n",
             path, host,
-        )
-        .unwrap();
-        stream.flush().unwrap();
+        );
+        tls.write_all(data.as_bytes()).await?;
 
         let mut buf = [0; 4096];
-        let bytes = stream.read(&mut buf)?;
+        let bytes = tls.read(&mut buf).await?;
 
         let mut headers = [httparse::EMPTY_HEADER; 64];
         let mut response = httparse::Response::new(&mut headers);
@@ -138,26 +143,86 @@ impl Client {
         );
 
         Ok(Client {
-            stream,
+            stream: tls,
             rng: XorshiroRng::new(),
         })
     }
 
-    /// Send a websocket message, blocking if needed
-    pub fn send(&mut self, message: &Message) -> Result<(), crate::Error> {
-        write_message(&mut self.stream, &mut self.rng, message)
+    /// Send a message on the websocket
+    pub async fn send(&mut self, message: &Message) -> Result<(), Error> {
+        use tokio::io::AsyncWriteExt;
+
+        let (opcode, len) = match message {
+            Message::Text(b) => (1, b.len()),
+            Message::Binary(b) => (2, b.len()),
+            Message::Close(None) => (8, 0),
+            Message::Close(Some((_, b))) => (8, b.len() + 2),
+            Message::Ping(b) => (9, b.len()),
+            Message::Pong(b) => (10, b.len()),
+        };
+
+        if len > i64::max_value() as usize {
+            return Err(Error::Custom(
+                "Message length exceeds i64::max_value".to_string(),
+            ));
+        }
+
+        // write fin, rsv, and opcode.
+        // fin always 1, rsv always 0
+        self.stream.write_all(&[0b1000_0000 | opcode]).await?;
+
+        // First bit indicates if we're transmitting a mask.
+        // We always transmit a mask.
+
+        if len > u16::max_value() as usize {
+            self.stream.write_all(&[0b1000_0000 | 127]).await?;
+            self.stream.write_all(&(len as u64).to_be_bytes()).await?;
+        } else if len > 125 {
+            self.stream.write_all(&[0b1000_0000 | 126]).await?;
+            self.stream.write_all(&(len as u16).to_be_bytes()).await?;
+        } else {
+            self.stream.write_all(&[0b1000_0000 | len as u8]).await?;
+        }
+
+        let mask = self.rng.next_u32().to_ne_bytes();
+        self.stream.write_all(&mask).await?;
+
+        let mut data = match message {
+            Message::Text(b) => b.as_bytes().to_vec(),
+            Message::Binary(b) => b.to_vec(),
+            Message::Close(None) => Vec::new(),
+            Message::Close(Some((reason, b))) => reason
+                .to_be_bytes()
+                .iter()
+                .copied()
+                .chain(b.bytes())
+                .collect(),
+            Message::Ping(b) => b.to_vec(),
+            Message::Pong(b) => b.to_vec(),
+        };
+
+        // Apply the mask
+        for (d, m) in data.iter_mut().zip(mask.iter().cycle()) {
+            *d ^= m;
+        }
+
+        self.stream.write_all(&data).await?;
+
+        Ok(())
     }
 
     /// Recieve a websocket message, blocking until one is available
-    pub fn recv(&mut self) -> Result<Message, crate::Error> {
+    pub async fn recv(&mut self) -> Result<Message, crate::Error> {
+        use tokio::io::AsyncReadExt;
+
         let Frame {
             mut is_fin,
             opcode,
             mut data,
-        } = self.recv_frame()?;
+        } = self.recv_frame().await?;
 
         while !is_fin {
-            let frame = self.recv_frame()?;
+            let frame = self.recv_frame().await?;
             data.extend_from_slice(&frame.data);
             is_fin = frame.is_fin;
             if frame.opcode != 0 {
@@ -187,31 +252,30 @@ impl Client {
         })
     }
 
-    fn recv_frame(&mut self) -> std::io::Result<Frame> {
-        use crate::parse::ReadExt;
-
+    async fn recv_frame(&mut self) -> std::io::Result<Frame> {
+        use tokio::io::AsyncReadExt;
         let (fin, _rsv, opcode) = mask!(
-            self.stream.read_u8()?,
+            self.stream.read_u8().await?,
             0b1000_0000,
             0b0111_0000,
             0b0000_1111
         );
         let is_fin = fin > 0;
 
-        let (mask_byte, payload_length) = mask!(self.stream.read_u8()?, 0b1000_0000, 0b0111_1111);
+        let (mask_byte, payload_length) = mask!(self.stream.read_u8().await?, 0b1000_0000, 0b0111_1111);
         let has_mask = mask_byte > 0;
 
         let payload_length = if payload_length == 126 {
-            self.stream.read_u16_be()? as u64
+            self.stream.read_u16().await? as u64
         } else if payload_length == 127 {
-            self.stream.read_u64_be()?
+            self.stream.read_u64().await?
         } else {
             payload_length as u64
         };
 
         let masking_key = if has_mask {
             let mut key = [0; 4];
-            self.stream.read_exact(&mut key)?;
+            self.stream.read_exact(&mut key).await?;
             Some(key)
         } else {
             None
@@ -219,7 +283,7 @@ impl Client {
 
         let mut data = vec![0; payload_length as usize];
         if payload_length > 0 {
-            self.stream.read_exact(&mut data)?;
+            self.stream.read_exact(&mut data).await?;
         }
 
         if let Some(key) = masking_key {
@@ -234,71 +298,6 @@ impl Client {
             data,
         })
     }
-}
-
-// All messages are sent in one frame
-pub(crate) fn write_message(
-    stream: &mut impl std::io::Write,
-    rng: &mut XorshiroRng,
-    message: &Message,
-) -> Result<(), crate::Error> {
-    let (opcode, len) = match message {
-        Message::Text(b) => (1, b.len()),
-        Message::Binary(b) => (2, b.len()),
-        Message::Close(None) => (8, 0),
-        Message::Close(Some((_, b))) => (8, b.len() + 2),
-        Message::Ping(b) => (9, b.len()),
-        Message::Pong(b) => (10, b.len()),
-    };
-
-    if len > i64::max_value() as usize {
-        return Err(Error::Custom(
-            "Message length exceeds i64::max_value".to_string(),
-        ));
-    }
-
-    // write fin, rsv, and opcode.
-    // fin always 1, rsv always 0
-    stream.write_all(&[0b1000_0000 | opcode])?;
-
-    // First bit indicates if we're transmitting a mask.
-    // We always transmit a mask.
-
-    if len > u16::max_value() as usize {
-        stream.write_all(&[0b1000_0000 | 127])?;
-        stream.write_all(&(len as u64).to_be_bytes())?;
-    } else if len > 125 {
-        stream.write_all(&[0b1000_0000 | 126])?;
-        stream.write_all(&(len as u16).to_be_bytes())?;
-    } else {
-        stream.write_all(&[0b1000_0000 | len as u8])?;
-    }
-
-    let mask = rng.next_u32().to_ne_bytes();
-    stream.write_all(&mask)?;
-
-    let mut data = match message {
-        Message::Text(b) => b.as_bytes().to_vec(),
-        Message::Binary(b) => b.to_vec(),
-        Message::Close(None) => Vec::new(),
-        Message::Close(Some((reason, b))) => reason
-            .to_be_bytes()
-            .iter()
-            .copied()
-            .chain(b.bytes())
-            .collect(),
-        Message::Ping(b) => b.to_vec(),
-        Message::Pong(b) => b.to_vec(),
-    };
-
-    // Apply the mask
-    for (d, m) in data.iter_mut().zip(mask.iter().cycle()) {
-        *d ^= m;
-    }
-
-    stream.write_all(&data)?;
-
-    Ok(())
 }
 
 // The websocket RFC requires the contents of messages be randomly masked,

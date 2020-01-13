@@ -4,16 +4,6 @@ use mio::net::TcpStream;
 use rustls::Session;
 use std::io::{self, Read};
 
-lazy_static::lazy_static! {
-    pub static ref TLS_CONFIG: std::sync::Arc<rustls::ClientConfig> = {
-        let mut config = rustls::ClientConfig::new();
-        config
-            .root_store
-            .add_server_trust_anchors(&webpki_roots::TLS_SERVER_ROOTS);
-        std::sync::Arc::new(config)
-    };
-}
-
 /// This encapsulates the TCP-level connection, some connection
 /// state, and the underlying TLS-level session.
 /// This struct is taken almost entirely from ctz/rustls/examples/tlsclient.rs
